@@ -22,6 +22,7 @@ from layout.values import MISSING
 VOLUME = "shift-17"
 LAYOUT = replace(DEMO_LAYOUT, layout_id="differential-8")
 PAIR = ("x", "y")
+PAIRED_LAYOUT = replace(LAYOUT, calibration_pair=PAIR)
 ROWS = (
     InputRow("R-20", 4, 2, (17, 5)),
     InputRow("R-11", 5, 1, (20, 2)),
@@ -37,6 +38,11 @@ MIXED_ROWS = (("R-20", "y", 0), ("R-11", "y", 4), ("R-11", "z", 3))
 def install(path, layout=LAYOUT, volume_id=VOLUME):
     define(path, layout)
     return ingest(path, volume_id, layout.layout_id, ROWS, MANIFEST)
+
+
+def install_paired(path, volume_id=VOLUME):
+    """New archive over the same originals, but with the immutable calibration pair declared."""
+    return install(path, PAIRED_LAYOUT, volume_id)
 
 
 def exercise_legacy(path):

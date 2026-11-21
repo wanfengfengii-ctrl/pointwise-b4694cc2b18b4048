@@ -1,18 +1,17 @@
 from archive_db import WordUnavailable, checkpoint, connection, require_name, transaction
 from corrections.journal import read_field_evidence
+from delivery.evidence import build_pair_evidence
 from delivery.provenance import select_field_observation
-from delivery.selection import resolve_selection
+from delivery.selection import ObservationKey, resolve_selection
 from intake.archive import get_original
 from intake.origin import build_origin_index, locate_original_field
 from layout.codec import decode_field
+from layout.pairs import pair_fields
 from layout.registry import get_layout
 from words.store import read_word
 
 
-def read_current_fields(db, original, layout, keys=None, *, hook=None):
-    """Read within the caller's SQLite transaction, in the order of the supplied keys."""
-    if keys is None:
-        keys = resolve_selection(original, layout)
+def _read_keys(db, original, layout, keys, hook):
     origins = build_origin_index(original.volume_id, layout, original.rows)
     rows = {row.row_id: row for row in original.rows}
     fields = {field.name: field for field in layout.fields}
@@ -37,6 +36,13 @@ def read_current_fields(db, original, layout, keys=None, *, hook=None):
     return tuple(result)
 
 
+def read_current_fields(db, original, layout, keys=None, *, hook=None):
+    """Read within the caller's SQLite transaction, in the order of the supplied keys."""
+    if keys is None:
+        keys = resolve_selection(original, layout)
+    return _read_keys(db, original, layout, keys, hook)
+
+
 def current(path, volume_id, fields=None, *, hook=None):
     require_name(volume_id, 'volume id')
     with connection(path) as db, transaction(db):
@@ -44,3 +50,22 @@ def current(path, volume_id, fields=None, *, hook=None):
         layout = get_layout(db, original.layout_id)
         keys = resolve_selection(original, layout, fields)
         return read_current_fields(db, original, layout, keys, hook=hook)
+
+
+def read_calibration(path, volume_id, fields=None, *, hook=None):
+    """Current observations plus two-sided calibration evidence from one read snapshot."""
+    require_name(volume_id, 'volume id')
+    with connection(path) as db, transaction(db):
+        original = get_original(db, volume_id)
+        layout = get_layout(db, original.layout_id)
+        projected = read_current_fields(db, original, layout,
+                                        resolve_selection(original, layout, fields), hook=hook)
+        pair = pair_fields(layout)
+        if pair is None:
+            return projected, ()
+        # Reuse the fixed snapshot of this transaction so the evidence cannot drift mid-query.
+        pair_names = (pair[0].name, pair[1].name)
+        pair_keys = resolve_selection(original, layout, pair_names)
+        pair_observations = read_current_fields(db, original, layout, pair_keys)
+        evidence = build_pair_evidence(pair_observations, layout)
+    return projected, evidence

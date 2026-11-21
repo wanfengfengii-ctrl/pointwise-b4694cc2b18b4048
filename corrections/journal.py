@@ -40,11 +40,11 @@ class FieldEvidence:
     prepared_attempt: int | None = None
 
 
-def initialise_corrections(db):
+def _create_correction_tables(db):
     db.execute('''CREATE TABLE IF NOT EXISTS correction_requests (
         request_id TEXT PRIMARY KEY,
         volume_id TEXT NOT NULL REFERENCES originals(volume_id),
-        state TEXT NOT NULL CHECK (state IN ('pending', 'cancelling', 'cancelled', 'published')),
+        state TEXT NOT NULL CHECK (state IN ('pending', 'cancelling', 'cancelled', 'rejected', 'published')),
         publication INTEGER UNIQUE,
         report_id TEXT UNIQUE,
         CHECK ((state = 'published' AND publication IS NOT NULL AND report_id IS NOT NULL)
@@ -74,6 +74,62 @@ def initialise_corrections(db):
         PRIMARY KEY (request_id, row_id, field_name, phase),
         FOREIGN KEY (request_id, row_id, field_name) REFERENCES correction_fields(request_id, row_id, field_name)
     )''')
+
+
+def initialise_corrections(db):
+    _create_correction_tables(db)
+
+
+def migrate_rejection_state(db):
+    """Upgrade archives created before calibration rejections so the new state is legal."""
+    table = db.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'correction_requests'").fetchone()
+    if table is None:
+        return
+    check = db.execute("SELECT sql FROM sqlite_master WHERE name = 'correction_requests'").fetchone()[0]
+    if "'rejected'" in check:
+        return
+    # PRAGMA foreign_keys cannot change inside a transaction; the connection is in autocommit here.
+    # Every table referencing correction_requests must be rebuilt so its foreign key follows the
+    # new parent table rather than the renamed legacy one.
+    db.execute('PRAGMA foreign_keys = OFF')
+    try:
+        db.execute('ALTER TABLE correction_requests RENAME TO correction_requests_legacy')
+        db.execute('ALTER TABLE correction_fields RENAME TO correction_fields_legacy')
+        db.execute('ALTER TABLE correction_steps RENAME TO correction_steps_legacy')
+        reservations = db.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'field_reservations'").fetchone()
+        if reservations is not None:
+            db.execute('ALTER TABLE field_reservations RENAME TO field_reservations_legacy')
+            db.execute('DROP INDEX IF EXISTS reservations_by_holder')
+        _create_correction_tables(db)
+        db.execute('''INSERT INTO correction_requests
+            (request_id, volume_id, state, publication, report_id)
+            SELECT request_id, volume_id, state, publication, report_id FROM correction_requests_legacy''')
+        db.execute('''INSERT INTO correction_fields
+            (request_id, row_id, slot, field_name, ordinal, before_value, target_value,
+             before_request, before_publication, prepared_attempt)
+            SELECT request_id, row_id, slot, field_name, ordinal, before_value, target_value,
+                   before_request, before_publication, prepared_attempt FROM correction_fields_legacy''')
+        db.execute('''INSERT INTO correction_steps
+            (request_id, row_id, field_name, phase, attempt_id)
+            SELECT request_id, row_id, field_name, phase, attempt_id FROM correction_steps_legacy''')
+        if reservations is not None:
+            db.execute('''CREATE TABLE field_reservations (
+                volume_id TEXT NOT NULL REFERENCES originals(volume_id),
+                row_id TEXT NOT NULL,
+                field_name TEXT NOT NULL,
+                holder TEXT NOT NULL REFERENCES correction_requests(request_id),
+                PRIMARY KEY (volume_id, row_id, field_name))''')
+            db.execute('''INSERT INTO field_reservations (volume_id, row_id, field_name, holder)
+                SELECT volume_id, row_id, field_name, holder FROM field_reservations_legacy''')
+            db.execute('CREATE INDEX reservations_by_holder ON field_reservations(holder)')
+        db.execute('DROP TABLE correction_steps_legacy')
+        db.execute('DROP TABLE correction_fields_legacy')
+        db.execute('DROP TABLE correction_requests_legacy')
+        if reservations is not None:
+            db.execute('DROP TABLE field_reservations_legacy')
+    finally:
+        db.execute('PRAGMA foreign_keys = ON')
 
 
 def canonical_request(changes):
@@ -133,7 +189,12 @@ def record_field_step(db, attempt):
 
 
 def record_terminal(db, request_id, state, *, publication=None, report_id=None):
-    predecessor = {'cancelling': 'pending', 'cancelled': 'cancelling', 'published': 'pending'}[state]
+    predecessor = {
+        'cancelling': 'pending',
+        'cancelled': 'cancelling',
+        'rejected': 'pending',
+        'published': 'pending',
+    }[state]
     changed = db.execute('''UPDATE correction_requests SET state = ?, publication = ?, report_id = ?
         WHERE request_id = ? AND state = ?''', (state, publication, report_id, request_id, predecessor))
     if changed.rowcount != 1:

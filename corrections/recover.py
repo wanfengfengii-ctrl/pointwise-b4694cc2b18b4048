@@ -17,14 +17,26 @@ class CancelledCorrection:
     volume_id: str
 
 
+@dataclass(frozen=True)
+class CalibrationRejection:
+    request_id: str
+    volume_id: str
+
+
 def _load_work(db, request):
     original = get_original(db, request.volume_id)
     return get_layout(db, original.layout_id), request_fields(db, request.request_id)
 
 
 def _eligible_changes(db, request_id, address, fields, phase):
-    expected_state = {'prepare': 'pending', 'cancel': 'cancelling', 'settle': 'published'}[phase]
-    if load_request(db, request_id).state != expected_state:
+    if phase == 'settle':
+        expected_state = 'published'
+    elif phase == 'cancel':
+        expected_state = ('pending', 'cancelling', 'rejected')
+    else:
+        expected_state = 'pending'
+    state = load_request(db, request_id).state
+    if state not in expected_state:
         return {}
     changes = {}
     for item in fields:
@@ -62,12 +74,41 @@ def settle_published(path, request_id, *, hook=None):
     return receipt
 
 
+def finish_rejection(path, request_id, *, hook=None):
+    """Roll back the request's prepared bit segments and return the fixed rejection."""
+    with connection(path) as db, transaction(db):
+        request = load_request(db, request_id)
+        if request.state != 'rejected':
+            raise ConflictError(f'request is not rejected: {request_id}')
+        layout, facts = _load_work(db, request)
+    _drive_words(path, request, layout, facts, 'cancel', hook)
+    with connection(path) as db, transaction(db, write=True):
+        facts = request_fields(db, request_id)
+        for address, fields in group_field_evidence(facts):
+            # Only the segments this request reserved and prewrote are rolled back; fields on
+            # the same physical word that other requests already signed keep their provenance.
+            held = tuple(item for item in fields
+                         if check_field_holder(db, address, item.field_name) == request_id)
+            for item in fields:
+                if item in held:
+                    continue
+                if check_field_holder(db, address, item.field_name) is not None:
+                    raise WordUnavailable(f'rejection cleanup ownership not confirmed at {address}')
+            if held and not fields_match(db, layout, address,
+                                         {item.field_name: item.before for item in held}):
+                raise WordUnavailable(f'rejection cleanup differs at {address}')
+        release_fields(db, request_id)
+    return CalibrationRejection(request_id, request.volume_id)
+
+
 def cancel_pending(path, request_id, *, hook=None):
     with connection(path) as db, transaction(db, write=True):
         request = load_request(db, request_id)
         result = CancelledCorrection(request_id, request.volume_id)
         if request.state == 'published':
             raise ConflictError(f'published request cannot be cancelled: {request_id}')
+        if request.state == 'rejected':
+            raise ConflictError(f'rejected request cannot be cancelled: {request_id}')
         if request.state == 'cancelled':
             return result
         if request.state == 'pending':
@@ -98,11 +139,17 @@ def advance_correction(path, request_id, *, hook=None):
         return settle_published(path, request_id, hook=hook)
     if request.state == 'cancelled':
         return CancelledCorrection(request_id, request.volume_id)
+    if request.state == 'rejected':
+        return finish_rejection(path, request_id, hook=hook)
     if request.state == 'pending':
         _drive_words(path, request, layout, facts, 'prepare', hook)
-        receipt = publish_correction(path, request_id, hook=hook)
-        if receipt is not None:
-            return receipt
+        publish_correction(path, request_id, hook=hook)
+        with connection(path) as db, transaction(db):
+            outcome = load_request(db, request_id)
+        if outcome.state == 'published':
+            return settle_published(path, request_id, hook=hook)
+        if outcome.state == 'rejected':
+            return finish_rejection(path, request_id, hook=hook)
     return cancel_pending(path, request_id, hook=hook)
 
 

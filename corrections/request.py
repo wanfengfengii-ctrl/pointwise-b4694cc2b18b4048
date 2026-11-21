@@ -1,7 +1,8 @@
 from archive_db import NotFound, connection, require_name, transaction
-from corrections.journal import FieldEvidence, canonical_request, load_request, match_request, record_pending
+from corrections.calibration import evaluate_request, pair_fields
+from corrections.journal import FieldEvidence, canonical_request, load_request, match_request, record_pending, record_terminal
 from corrections.pending import reserve_fields
-from corrections.recover import advance_correction
+from corrections.recover import CalibrationRejection, advance_correction, finish_rejection
 from delivery.current import read_current_fields
 from delivery.selection import ObservationKey
 from intake.archive import get_original
@@ -30,7 +31,17 @@ def _admit(db, request_id, original, layout, targets):
                                    value, observation.provenance.request_id, observation.provenance.publication)
                      for (origin, value), observation in zip(located, observations, strict=True))
     record_pending(db, request_id, original.volume_id, evidence)
+    # Ordinary-field-only requests follow the legacy path even when the original row itself is inverted.
+    if pair_fields(layout) is None:
+        reserve_fields(db, request_id, evidence)
+        return 'pending'
+    projection = evaluate_request(db, original, layout, targets)
+    if any(item.status == 'inverted' for item in projection):
+        # No physical segment has been written and no field is reserved; the rejection is already final.
+        record_terminal(db, request_id, 'rejected')
+        return 'rejected'
     reserve_fields(db, request_id, evidence)
+    return 'pending'
 
 
 def amend(path, volume_id, request_id, changes, *, hook=None):
@@ -43,7 +54,13 @@ def amend(path, volume_id, request_id, changes, *, hook=None):
         except NotFound:
             original = get_original(db, volume_id)
             layout = get_layout(db, original.layout_id)
-            _admit(db, request_id, original, layout, targets)
+            admitted = _admit(db, request_id, original, layout, targets)
         else:
             match_request(prior, volume_id, targets)
-    return advance_correction(path, request_id, hook=hook)
+            admitted = prior.state
+    if admitted == 'rejected':
+        return CalibrationRejection(request_id, volume_id)
+    result = advance_correction(path, request_id, hook=hook)
+    if isinstance(result, CalibrationRejection):
+        return finish_rejection(path, request_id, hook=hook)
+    return result

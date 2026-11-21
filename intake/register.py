@@ -1,5 +1,5 @@
 from archive_db import NotFound, connection, require_name, transaction
-from corrections.journal import initialise_corrections
+from corrections.journal import initialise_corrections, migrate_rejection_state
 from corrections.pending import initialise_reservations
 from delivery.current import read_current_fields
 from delivery.snapshot import FixedReport, initialise_reports, save_fixed_report
@@ -15,6 +15,8 @@ def initialise_archive(path):
         mode = db.execute('PRAGMA journal_mode = WAL').fetchone()[0]
         if mode.lower() != 'wal':
             raise ValueError('archive requires a SQLite file supporting WAL')
+        # Table rebuilds must run outside a transaction so the foreign_key pragma takes effect.
+        migrate_rejection_state(db)
         with transaction(db, write=True):
             initialise_layouts(db)
             initialise_originals(db)

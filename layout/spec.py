@@ -22,6 +22,21 @@ class LayoutSpec:
     word_bits: int
     words_per_row: int
     fields: tuple[FieldSpec, ...]
+    calibration_pair: tuple[str, str] | None = None
+
+
+def validate_pair(fields, pair):
+    if pair is None:
+        return None
+    if not isinstance(pair, (tuple, list)) or len(pair) != 2 or any(not isinstance(name, str) for name in pair):
+        raise ValueError('calibration_pair must be two field names (lower, upper)')
+    lower, upper = pair
+    names = {field.name for field in fields}
+    if lower not in names or upper not in names:
+        raise ValueError('calibration_pair must reference existing layout fields')
+    if lower == upper:
+        raise ValueError('calibration_pair lower and upper must be different fields')
+    return lower, upper
 
 
 def validate_layout(spec):
@@ -57,4 +72,5 @@ def validate_layout(spec):
             raise ValueError(f'overlapping bit segment for {field.name}')
         occupied[field.slot] = word_mask | field.mask
         names.add(field.name)
-    return LayoutSpec(spec.layout_id, spec.word_bits, spec.words_per_row, fields)
+    pair = validate_pair(fields, spec.calibration_pair)
+    return LayoutSpec(spec.layout_id, spec.word_bits, spec.words_per_row, fields, pair)

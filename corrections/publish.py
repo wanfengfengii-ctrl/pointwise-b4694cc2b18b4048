@@ -1,4 +1,5 @@
 from archive_db import WordUnavailable, checkpoint, connection, transaction
+from corrections.calibration import inverted_rows
 from corrections.journal import CorrectionReceipt as CorrectionReceipt
 from corrections.journal import group_field_evidence, load_request, published_receipt, record_terminal, request_fields
 from corrections.pending import check_field_holder, release_fields
@@ -36,6 +37,13 @@ def publish_correction(path, request_id, *, hook=None):
         layout = get_layout(db, original.layout_id)
         facts = request_fields(db, request_id)
         _check_ready(db, request, layout, facts)
+        targets = tuple((item.address.row_id, item.field_name, item.target) for item in facts)
+        # The gate is decided on the now-current published snapshot, never on other pending writes.
+        if inverted_rows(db, original, layout, targets):
+            # Reservations are kept so the prepared bit segments can be rolled back on resume,
+            # then released by finish_rejection once the words are restored.
+            record_terminal(db, request_id, 'rejected')
+            return None
         publication = db.execute('SELECT COALESCE(MAX(publication), 0) + 1 FROM correction_requests').fetchone()[0]
         report_id = f'correction:{request_id}'
         receipt = CorrectionReceipt(request_id, request.volume_id, publication, report_id)

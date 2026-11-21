@@ -1,11 +1,12 @@
 import json
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from archive_db import ReplyLost
-from corrections.recover import resume
+from corrections.recover import CalibrationRejection, resume
 from corrections.request import amend
-from delivery.current import current
+from delivery.current import current, read_calibration
 from delivery.reconcile import reconcile
 from delivery.snapshot import frozen
 from intake.manifest import ManifestEntry
@@ -88,6 +89,84 @@ def _scenario(path, action):
     print('POINTWISE_SCENARIO ' + json.dumps(record, ensure_ascii=False, sort_keys=True))
 
 
+def _calibration_demo(path):
+    # Imported lazily so demo.py stays runnable while the fixture evolves independently.
+    from calibration_case import (AUXILIARY, LOWER, PAIRED_LAYOUT, ROWS, MANIFEST, UPPER, VOLUME,
+                                  install_paired, reading_group, source_group)
+    from intake.register import ingest
+
+    def value(item):
+        return None if item.value is MISSING else item.value
+
+    def night(volume, fields=('x',)):
+        observations, evidence = read_calibration(path, volume, fields)
+        return {
+            'projected': [(item.row_id, item.field_name, value(item)) for item in observations],
+            'evidence': [(item.row_id, item.status,
+                          (value(item.lower), item.lower.provenance.request_id,
+                           item.lower.provenance.original.address.slot),
+                          (value(item.upper), item.upper.provenance.request_id,
+                           item.upper.provenance.original.address.slot))
+                         for item in evidence],
+        }
+
+    # Volume one: ordinary qualified signing and the night-shift, one-sided projection.
+    install_paired(path)
+    initial_night = night(VOLUME)
+    lower = amend(path, VOLUME, 'cal-lower', LOWER)
+    auxiliary = amend(path, VOLUME, 'cal-aux', AUXILIARY)
+    qualified_night = night(VOLUME)
+    # An inverted request is rejected at admission, replayed by the original id and signed nothing.
+    admission_rejection = amend(path, VOLUME, 'cal-inverted', (('R-11', 'z', 5), ('R-11', 'x', 6),))
+
+    # Volume two: the prewrite race that the archive must adjudicate at publish time.
+    race_volume = 'shift-17-race'
+    ingest(path, race_volume, PAIRED_LAYOUT.layout_id, ROWS, MANIFEST)
+    try:
+        amend(path, race_volume, 'cal-race', LOWER, hook=lose_at('after_word_commit'))
+    except ReplyLost as loss:
+        loss_event = loss.event
+    else:
+        raise AssertionError('Expected the in-flight calibration reply to be lost')
+    race_auxiliary = amend(path, race_volume, 'race-aux', AUXILIARY)
+    upper = amend(path, race_volume, 'race-upper', UPPER)
+    # Resuming the original request now projects (4, 2): the gate rejects and rolls the
+    # prepared segment back, preserving the ordinary z change and its provenance.
+    rejection = resume(path, 'cal-race')
+    final_night = night(race_volume)
+    ledger = reconcile(path, race_volume)
+
+    record = {
+        'case_id': 'v7.calibration_pair_handoff',
+        'layout': {'layout_id': PAIRED_LAYOUT.layout_id, 'calibration_pair': list(PAIRED_LAYOUT.calibration_pair)},
+        'initial_night': initial_night,
+        'signing_volume': {
+            'lower': (lower.request_id, lower.publication),
+            'ordinary_auxiliary': (auxiliary.request_id, auxiliary.publication),
+            'admission_rejection': (admission_rejection.request_id, admission_rejection.volume_id),
+            'qualified_night': qualified_night,
+        },
+        'race_volume': {
+            'lost_reply_event': loss_event,
+            'upper_signed': (upper.request_id, upper.publication),
+            'ordinary_auxiliary': (race_auxiliary.request_id, race_auxiliary.publication),
+            'rejection': {'request_id': rejection.request_id, 'volume_id': rejection.volume_id,
+                          'replayed_same_result': amend(path, race_volume, 'cal-race', LOWER) == rejection},
+            'final_night': final_night,
+            'final_r20_values': reading_group(current(path, race_volume)),
+            'final_r20_sources': source_group(current(path, race_volume)),
+            'physical_words': tuple(word.actual_word for word in ledger.words[:2]),
+            'reconcile_settled': ledger.settled,
+        },
+        'code_paths': ['layout/pairs.py', 'corrections/calibration.py', 'corrections/publish.py',
+                       'corrections/recover.py', 'delivery/current.py', 'delivery/evidence.py'],
+        'oracle': '下限大于上限即倒置整单拒签；任一侧缺测放行；拒签结清本单位段并保全别单出处，夜班按原行序给两侧值与判定。',
+    }
+    assert isinstance(admission_rejection, CalibrationRejection)
+    assert isinstance(rejection, CalibrationRejection)
+    print('POINTWISE_CALIBRATION ' + json.dumps(record, ensure_ascii=False, sort_keys=True))
+
+
 def main():
     with TemporaryDirectory() as directory:
         path = Path(directory) / 'day.sqlite3'
@@ -95,6 +174,7 @@ def main():
         define(path, LAYOUT)
         _scenario(path, 'continue')
         _scenario(path, 'cancel')
+        _calibration_demo(path)
 
 
 if __name__ == '__main__':

@@ -19,7 +19,10 @@ def _definition(spec):
         if field.missing_code is not None:
             item['missing_code'] = format(field.missing_code, 'x')
         fields.append(item)
-    return json.dumps([spec.word_bits, spec.words_per_row, fields], separators=(',', ':'), sort_keys=True)
+    body = [spec.word_bits, spec.words_per_row, fields]
+    if spec.calibration_pair is not None:
+        body.append(list(spec.calibration_pair))
+    return json.dumps(body, separators=(',', ':'), sort_keys=True)
 
 
 def define(path, spec):
@@ -38,8 +41,10 @@ def get_layout(db, layout_id):
     row = db.execute('SELECT definition FROM layouts WHERE layout_id = ?', (layout_id,)).fetchone()
     if row is None:
         raise NotFound(f'unknown layout {layout_id}')
-    word_bits, words_per_row, fields = json.loads(row['definition'])
+    body = json.loads(row['definition'])
+    word_bits, words_per_row, fields = body[:3]
+    pair = tuple(body[3]) if len(body) > 3 and body[3] is not None else None
     for field in fields:
         if field['missing_code'] is not None:
             field['missing_code'] = int(field['missing_code'], 16)
-    return LayoutSpec(layout_id, word_bits, words_per_row, tuple(FieldSpec(**field) for field in fields))
+    return LayoutSpec(layout_id, word_bits, words_per_row, tuple(FieldSpec(**field) for field in fields), pair)
